@@ -1,8 +1,18 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import process from "node:process";
 import crossSpawn from "cross-spawn";
-import { type JsonRpcMessage, McpAbortError, McpConnectionClosedError, parseJsonRpcMessage } from "../protocol/jsonrpc.ts";
-import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, type McpTransportSendOptions, TransportEvents } from "./transport.ts";
+import {
+	type JsonRpcMessage,
+	McpAbortError,
+	McpConnectionClosedError,
+	parseJsonRpcMessage,
+} from "../protocol/jsonrpc.ts";
+import {
+	DEFAULT_MAX_MESSAGE_BYTES,
+	type McpTransport,
+	type McpTransportSendOptions,
+	TransportEvents,
+} from "./transport.ts";
 
 const DEFAULT_MAX_STDERR_BYTES = 64 * 1024;
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
