@@ -156,6 +156,7 @@ export class McpClient {
 	readonly options: Readonly<McpClientOptions>;
 	private state: ClientState = "idle";
 	private transport: McpTransport | undefined;
+	private closePromise: Promise<void> | undefined;
 	private nextRequestId = 1;
 	private serverInfoValue: Implementation | undefined;
 	private serverCapabilitiesValue: ServerCapabilities | undefined;
@@ -235,12 +236,19 @@ export class McpClient {
 			if (!(SUPPORTED_PROTOCOL_VERSIONS as readonly string[]).includes(result.protocolVersion)) {
 				throw new Error(`MCP server selected unsupported protocol version ${result.protocolVersion}`);
 			}
+			if (this.requireTransport(true) !== transport) {
+				throw new McpConnectionClosedError("MCP transport changed during initialization");
+			}
 			this.protocolVersionValue = result.protocolVersion;
 			this.serverInfoValue = result.serverInfo;
 			this.serverCapabilitiesValue = result.capabilities;
 			this.instructionsValue = result.instructions;
 			transport.setProtocolVersion?.(result.protocolVersion);
 			await this.notifyInternal("notifications/initialized", undefined, true);
+			// A completed send must not reopen a connection closed while it was pending.
+			if (this.requireTransport(true) !== transport) {
+				throw new McpConnectionClosedError("MCP transport changed during initialization");
+			}
 			this.state = "connected";
 			return result;
 		} catch (error) {
@@ -385,12 +393,38 @@ export class McpClient {
 		);
 	}
 
-	async close(): Promise<void> {
+	close(): Promise<void> {
+		if (this.closePromise) return this.closePromise;
+		let resolveClose!: () => void;
+		let rejectClose!: (reason?: unknown) => void;
+		this.closePromise = new Promise<void>((resolve, reject) => {
+			resolveClose = resolve;
+			rejectClose = reject;
+		});
 		const transport = this.transport;
 		this.transport = undefined;
-		this.disposeTransportListeners();
-		this.markClosed(new McpConnectionClosedError());
-		await transport?.close();
+		let cleanupError: unknown;
+		let cleanupFailed = false;
+		const recordFailure = (error: unknown) => {
+			if (!cleanupFailed) {
+				cleanupFailed = true;
+				cleanupError = error;
+			}
+		};
+		try { this.disposeTransportListeners(); }
+		catch (error) { recordFailure(error); }
+		try { this.markClosed(new McpConnectionClosedError()); }
+		catch (error) { recordFailure(error); }
+		// Observer failures must never skip the owned transport's cleanup.
+		try {
+			Promise.resolve(transport?.close()).then(
+				() => cleanupFailed ? rejectClose(cleanupError) : resolveClose(),
+				(error) => rejectClose(cleanupFailed ? cleanupError : error),
+			);
+		} catch (error) {
+			rejectClose(cleanupFailed ? cleanupError : error);
+		}
+		return this.closePromise;
 	}
 
 	private async requestInternal(
@@ -491,33 +525,46 @@ export class McpClient {
 
 	private async handleRequest(message: JsonRpcRequest): Promise<void> {
 		const transport = this.transport;
-		if (!transport) return;
-		const handler = this.requestHandlers.get(message.method);
-		if (!handler) {
-			await transport
-				.send({
-					jsonrpc: "2.0",
-					id: message.id,
-					error: { code: JSON_RPC_ERROR_CODES.methodNotFound, message: `Method not found: ${message.method}` },
-				})
-				.catch((error) => this.emitError(error));
+		if (!transport || (this.state !== "connecting" && this.state !== "connected")) return;
+		// Keep the original operation tracked: a duplicate id must not orphan its send.
+		if (this.incoming.has(message.id)) {
+			this.emitError(new McpError(JSON_RPC_ERROR_CODES.invalidRequest, "Duplicate active MCP request id"));
 			return;
 		}
 		const controller = new AbortController();
 		this.incoming.set(message.id, controller);
+		const canReply = () =>
+			!controller.signal.aborted &&
+			this.incoming.get(message.id) === controller &&
+			this.transport === transport &&
+			(this.state === "connecting" || this.state === "connected");
 		try {
-			const result = await handler(message.params, { signal: controller.signal });
-			await transport.send({ jsonrpc: "2.0", id: message.id, result: result ?? {} });
-		} catch (error) {
-			const responseError =
-				error instanceof McpError
-					? { code: error.code, message: error.message, data: error.data }
-					: { code: JSON_RPC_ERROR_CODES.internalError, message: toError(error).message };
-			await transport
-				.send({ jsonrpc: "2.0", id: message.id, error: responseError })
-				.catch((sendError) => this.emitError(sendError));
+			let response: JsonRpcResponse;
+			try {
+				const handler = this.requestHandlers.get(message.method);
+				if (!handler) {
+					throw new McpError(JSON_RPC_ERROR_CODES.methodNotFound, `Method not found: ${message.method}`);
+				}
+				const result = await handler(message.params, { signal: controller.signal });
+				response = { jsonrpc: "2.0", id: message.id, result: result ?? {} };
+			} catch (error) {
+				if (!canReply()) return;
+				const responseError =
+					error instanceof McpError
+						? { code: error.code, message: error.message, data: error.data }
+						: { code: JSON_RPC_ERROR_CODES.internalError, message: toError(error).message };
+				response = { jsonrpc: "2.0", id: message.id, error: responseError };
+			}
+			if (!canReply()) return;
+			try {
+				// Abort also prevents a transport's deferred authorization retry from dispatching.
+				await transport.send(response, { signal: controller.signal });
+			} catch (sendError) {
+				// A failed response send is not a handler failure: never send a second response.
+				if (canReply()) this.emitError(sendError);
+			}
 		} finally {
-			this.incoming.delete(message.id);
+			if (this.incoming.get(message.id) === controller) this.incoming.delete(message.id);
 		}
 	}
 
@@ -601,13 +648,23 @@ export class McpClient {
 		for (const controller of this.incoming.values()) controller.abort(error);
 		this.incoming.clear();
 		if (wasClosed) return;
+		let reportingFailed = false;
+		let firstReportingError: unknown;
 		for (const listener of [...this.closeListeners]) {
 			try {
 				listener();
 			} catch (listenerError) {
-				this.emitError(listenerError);
+				try {
+					this.emitError(listenerError);
+				} catch (reportingError) {
+					if (!reportingFailed) {
+						reportingFailed = true;
+						firstReportingError = reportingError;
+					}
+				}
 			}
 		}
+		if (reportingFailed) throw firstReportingError;
 	}
 
 	private emitError(error: unknown): void {
@@ -616,6 +673,17 @@ export class McpClient {
 	}
 
 	private disposeTransportListeners(): void {
-		for (const dispose of this.disposers.splice(0)) dispose();
+		let failed = false;
+		let firstError: unknown;
+		for (const dispose of this.disposers.splice(0)) {
+			try { dispose(); }
+			catch (error) {
+				if (!failed) {
+					failed = true;
+					firstError = error;
+				}
+			}
+		}
+		if (failed) throw firstError;
 	}
 }
