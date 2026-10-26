@@ -411,14 +411,20 @@ export class McpClient {
 				cleanupError = error;
 			}
 		};
-		try { this.disposeTransportListeners(); }
-		catch (error) { recordFailure(error); }
-		try { this.markClosed(new McpConnectionClosedError()); }
-		catch (error) { recordFailure(error); }
+		try {
+			this.disposeTransportListeners();
+		} catch (error) {
+			recordFailure(error);
+		}
+		try {
+			this.markClosed(new McpConnectionClosedError());
+		} catch (error) {
+			recordFailure(error);
+		}
 		// Observer failures must never skip the owned transport's cleanup.
 		try {
 			Promise.resolve(transport?.close()).then(
-				() => cleanupFailed ? rejectClose(cleanupError) : resolveClose(),
+				() => (cleanupFailed ? rejectClose(cleanupError) : resolveClose()),
 				(error) => rejectClose(cleanupFailed ? cleanupError : error),
 			);
 		} catch (error) {
@@ -676,8 +682,9 @@ export class McpClient {
 		let failed = false;
 		let firstError: unknown;
 		for (const dispose of this.disposers.splice(0)) {
-			try { dispose(); }
-			catch (error) {
+			try {
+				dispose();
+			} catch (error) {
 				if (!failed) {
 					failed = true;
 					firstError = error;
