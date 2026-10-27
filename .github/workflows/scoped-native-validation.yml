@@ -47,6 +47,8 @@ jobs:
             set -euo pipefail
             cd packages/chord
             node ../../node_modules/vitest/dist/cli.js --run test/manager.test.ts
+            cd ../coding-agent
+            node ../../node_modules/vitest/dist/cli.js --run test/model-catalog-protocol.test.ts
             cd ../env
             node ../../node_modules/vitest/dist/cli.js --run test/conformance.test.ts
           '

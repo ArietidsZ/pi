@@ -115,38 +115,49 @@ describe("model catalog protocol with the current client", () => {
 			catalogBaseUrl,
 			refreshOnCreate: false,
 		});
-		await runtime.setRuntimeApiKey("openrouter", "test-key");
-		const refresh = await runtime.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
-		expect([...refresh.errors]).toEqual([]);
-
-		const catalogUrl = "/api/models/providers/openrouter?types=chat%2Cimage%2Cclassifier";
-		expect(requests).toEqual([catalogUrl, `${catalogUrl}&pi-version=${VERSION}`]);
-
-		const expectedModel =
-			selectModelCatalog(index, VERSION)?.revision === legacyRevision ? legacyModel : mixedApiModel;
-		const model = runtime.getModel("openrouter", modelId);
-		expect(model).toMatchObject({ api: expectedModel.api, baseUrl: expectedModel.baseUrl });
-		if (!model) throw new Error(`Missing model: openrouter/${modelId}`);
-
 		let providerUrl: URL | undefined;
+		let personalizedRequests = 0;
 		const nativeFetch = globalThis.fetch;
+		// #9099: install interception before refresh, including account-specific catalog requests.
 		vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
 			const request = new Request(input, init);
-			if (new URL(request.url).origin !== "https://openrouter.ai") return nativeFetch(request);
-			providerUrl = new URL(request.url);
-			throw new Error("Provider request captured");
+			const url = new URL(request.url);
+			if (url.origin === catalogBaseUrl) return nativeFetch(request);
+			if (url.href === "https://openrouter.ai/api/v1/models/user" && request.method === "GET") {
+				personalizedRequests++;
+				return Response.json({ data: [{ id: modelId }] });
+			}
+			if (url.origin === "https://openrouter.ai" && request.method === "POST") {
+				providerUrl = url;
+				throw new Error("Provider request captured");
+			}
+			throw new Error(`Unexpected external request: ${request.method} ${url.href}`);
 		});
 		try {
+			await runtime.setRuntimeApiKey("openrouter", "test-key");
+			const refresh = await runtime.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
+			expect([...refresh.errors]).toEqual([]);
+
+			const catalogUrl = "/api/models/providers/openrouter?types=chat%2Cimage%2Cclassifier";
+			expect(requests).toEqual([catalogUrl, `${catalogUrl}&pi-version=${VERSION}`]);
+
+			const expectedModel =
+				selectModelCatalog(index, VERSION)?.revision === legacyRevision ? legacyModel : mixedApiModel;
+			const model = runtime.getModel("openrouter", modelId);
+			expect(model).toMatchObject({ api: expectedModel.api, baseUrl: expectedModel.baseUrl });
+			if (!model) throw new Error(`Missing model: openrouter/${modelId}`);
+
 			await runtime.completeSimple(
 				model,
 				{ messages: [{ role: "user", content: "Hello", timestamp: 0 }] },
 				{ apiKey: "test-key", maxRetries: 0 },
 			);
+			expect(personalizedRequests).toBeGreaterThan(0);
+			expect(providerUrl?.pathname).toBe(
+				expectedModel.api === "anthropic-messages" ? "/api/v1/messages" : "/api/v1/chat/completions",
+			);
 		} finally {
 			vi.unstubAllGlobals();
 		}
-		expect(providerUrl?.pathname).toBe(
-			expectedModel.api === "anthropic-messages" ? "/api/v1/messages" : "/api/v1/chat/completions",
-		);
 	});
 });
