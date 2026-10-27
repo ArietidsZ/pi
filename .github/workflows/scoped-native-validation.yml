@@ -1,0 +1,53 @@
+name: Scoped native validation
+on:
+  push:
+    branches: [dots/native-validation-20261027]
+permissions:
+  contents: read
+jobs:
+  native-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.22.1
+      - name: Prepare tools
+        run: |
+          npm install --global npm@12.2.1 --ignore-scripts
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep
+          rustup toolchain install 1.96.0 --profile minimal
+      - name: Install frozen dependencies
+        run: npm ci --ignore-scripts
+      - name: Hydrate immutable baseline catalog
+        run: |
+          curl --fail --location --proto '=https' --proto-redir '=https' --max-time 120 'https://pi.dev/api/models/revisions/sha256-7fe1b41feaf43a7aad4bc832e6b306c7ced56e6d41bbc724b74e91eeacff6edf?types=chat,image,classifier' -o "$RUNNER_TEMP/catalog.json"
+          echo "7fe1b41feaf43a7aad4bc832e6b306c7ced56e6d41bbc724b74e91eeacff6edf  $RUNNER_TEMP/catalog.json" | sha256sum -c -
+          node packages/ai/scripts/hydrate-model-catalog.ts "$RUNNER_TEMP/catalog.json"
+      - name: Build offline prerequisites
+        run: |
+          npm run build:offline
+          cargo +1.96.0 build --manifest-path packages/env/daemon/Cargo.toml --locked
+      - name: Isolated native tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d /tmp/pi-native.XXXXXX)"
+          mkdir -p "$root/home" "$root/tmp" "$root/bin"
+          ln -s "$(command -v fdfind)" "$root/bin/fd"
+          # A synthetic ancestor repository invalidates the conformance fixture.
+          for path in / /tmp; do
+            test ! -e "$path/.git"
+          done
+          env -i PATH="$root/bin:$PATH" HOME="$root/home" TMPDIR="$root/tmp" LANG=C TZ=UTC PI_OFFLINE=1 PI_NO_LOCAL_LLM=1 AWS_EC2_METADATA_DISABLED=true GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 bash -c '
+            set -euo pipefail
+            cd packages/chord
+            node ../../node_modules/vitest/dist/cli.js --run test/manager.test.ts
+            cd ../env
+            node ../../node_modules/vitest/dist/cli.js --run test/conformance.test.ts
+          '
+          git diff --exit-code
