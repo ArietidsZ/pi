@@ -178,6 +178,39 @@ function discard(response: Response): Promise<void> {
 	return response.body?.cancel().catch(() => {}) ?? Promise.resolve();
 }
 
+/** Bound bytes while reading, before JSON parsing or retaining a diagnostic prefix. */
+async function readResponseText(response: Response, maxBytes: number, truncate: boolean): Promise<string> {
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let bytes = 0;
+	let text = "";
+	let complete = false;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) {
+				complete = true;
+				return text + decoder.decode();
+			}
+			const remaining = maxBytes - bytes;
+			if (value.byteLength > remaining) {
+				if (!truncate) throw new Error(`MCP JSON response exceeds ${maxBytes} bytes`);
+				// Do not flush an incomplete UTF-8 character at a truncated diagnostic boundary.
+				return text + decoder.decode(value.subarray(0, remaining), { stream: true });
+			}
+			bytes += value.byteLength;
+			text += decoder.decode(value, { stream: true });
+			if (truncate && bytes === maxBytes) return text;
+		}
+	} finally {
+		// An oversized or unending response must not retain the connection. A custom
+		// stream's cancellation hook need not settle before this read rejects/returns.
+		if (!complete) void reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
+}
+
 function describeHttpFailure(status: number, body: string): string {
 	const text = body.trim();
 	const snippet = text.length > ERROR_MESSAGE_BODY_CHARS ? `${text.slice(0, ERROR_MESSAGE_BODY_CHARS - 3)}...` : text;
@@ -253,7 +286,9 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		}
 		const type = contentType(response);
 		if (type === "application/json") {
-			const body: unknown = await response.json();
+			const body: unknown = JSON.parse(
+				await readResponseText(response, this.options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES, false),
+			);
 			for (const item of Array.isArray(body) ? body : [body]) this.emitMessage(parseJsonRpcMessage(item));
 			return;
 		}
@@ -338,8 +373,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 
 	private async checkResponse(response: Response): Promise<void> {
 		if (response.ok) return;
-		// A copy, not a slice: V8 slices keep the whole body alive, and the error keeps this excerpt.
-		const body = `${(await response.text().catch(() => "")).slice(0, MAX_ERROR_BODY_BYTES)} `.slice(0, -1);
+		const body = await readResponseText(response, MAX_ERROR_BODY_BYTES, true).catch(() => "");
 		if (response.status === 401) throw new McpAuthRequiredError(response, body);
 		if (response.status === 404 && this.sessionIdValue) throw new McpSessionExpiredError(body);
 		throw new McpHttpError(response.status, describeHttpFailure(response.status, body), body);
