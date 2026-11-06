@@ -114,11 +114,24 @@ function main() {
 		}
 
 		// The built-in models users have: the data shipped in the published package.
-		const [packed] = JSON.parse(
+		const packResult = JSON.parse(
 			run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--ignore-scripts", "--pack-destination", temporaryDir, "--json"], root),
 		);
+		// npm 12 keys results by package name; npm 10/11 return an array.
+		let packed;
+		if (Array.isArray(packResult)) {
+			if (packResult.length === 1) packed = packResult[0];
+		} else if (
+			packResult !== null && typeof packResult === "object" &&
+			Object.keys(packResult).length === 1 && Object.hasOwn(packResult, PI_AI_PACKAGE)
+		) {
+			packed = packResult[PI_AI_PACKAGE];
+		}
 		if (packed?.name !== PI_AI_PACKAGE || packed.version !== release) {
 			throw new Error(`Published package does not match ${PI_AI_PACKAGE}@${release}.`);
+		}
+		if (typeof packed.filename !== "string" || !/^[^/\\]+\.tgz$/.test(packed.filename)) {
+			throw new Error("Invalid packed package filename.");
 		}
 		run("tar", ["xzf", join(temporaryDir, packed.filename), "-C", temporaryDir, "package/dist/providers/data"], root);
 		const builtin = readBuiltinModels(join(temporaryDir, "package/dist/providers/data"));

@@ -13,7 +13,7 @@ const repositoryEnvironment = [
 	"GIT_CONFIG", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX",
 ];
 
-function fixture(t, { sourceVersion = "1.5.0", packVersion = "1.5.0", sourceName = "@earendil-works/pi-ai", packName = "@earendil-works/pi-ai", release = "1.5.0", tag = true, annotated = false, localTag = false, fetchError = false, typeError = false } = {}) {
+function fixture(t, { sourceVersion = "1.5.0", packVersion = "1.5.0", sourceName = "@earendil-works/pi-ai", packName = "@earendil-works/pi-ai", packOutput, release = "1.5.0", tag = true, annotated = false, localTag = false, fetchError = false, typeError = false } = {}) {
 	const root = mkdtempSync(join(tmpdir(), "pi-release-source-test-"));
 	t.after(() => rmSync(root, { recursive: true, force: true }));
 	const checkout = join(root, "checkout");
@@ -62,7 +62,7 @@ import childProcess from "node:child_process";
 import { appendFileSync, copyFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { syncBuiltinESMExports } from "node:module";
-const settings = ${JSON.stringify({ official, packed, log, packVersion, packName, release, fetchError, typeError, repositoryEnvironment })};
+const settings = ${JSON.stringify({ official, packed, log, packVersion, packName, packOutput, release, fetchError, typeError, repositoryEnvironment })};
 const spawn = childProcess.spawnSync;
 const ok = (stdout = "") => ({ status: 0, stdout, stderr: "" });
 childProcess.spawnSync = (command, args, options) => {
@@ -94,7 +94,7 @@ childProcess.spawnSync = (command, args, options) => {
     if (args[0] === "pack") {
       assert.ok(args.includes("--ignore-scripts"));
       copyFileSync(settings.packed, join(args[args.indexOf("--pack-destination") + 1], "fixture.tgz"));
-      return ok(JSON.stringify([{ filename: "fixture.tgz", name: settings.packName, version: settings.packVersion }]));
+      return ok(JSON.stringify(settings.packOutput === undefined ? [{ filename: "fixture.tgz", name: settings.packName, version: settings.packVersion }] : settings.packOutput));
     }
     assert.equal(readFileSync(join(options.cwd, "source-marker"), "utf8"), "official");
     if (args[0] === "ci") { assert.ok(args.includes("--ignore-scripts")); return ok(); }
@@ -186,3 +186,44 @@ test("rejects malformed npm versions before fetching source", (t) => {
 	assert.match(result.stderr, /Invalid Pi version/);
 	assert.equal(commands.length, 1);
 });
+
+const packedPackage = { filename: "fixture.tgz", name: "@earendil-works/pi-ai", version: "1.5.0" };
+
+test("accepts npm 12 pack metadata keyed by package name", (t) => {
+	const { result, commands } = fixture(t, { packOutput: { [packedPackage.name]: packedPackage } });
+	assert.equal(result.status, 0, result.stderr);
+	assert.match(result.stdout, /The model catalog is compatible with pi 1\.5\.0/);
+	assert.ok(commands.some(({ args }) => args[0] === "node_modules/typescript/bin/tsc"));
+});
+
+for (const [label, packOutput] of [
+	["null", null],
+	["primitive", "unexpected"],
+	["empty array", []],
+	["empty object", {}],
+	["bare package metadata", packedPackage],
+	["null package entry", { [packedPackage.name]: null }],
+	["multiple array entries", [packedPackage, packedPackage]],
+	["multiple object entries", { [packedPackage.name]: packedPackage, other: packedPackage }],
+	["incorrect object key", { other: packedPackage }],
+	["incorrect object name", { [packedPackage.name]: { ...packedPackage, name: "other" } }],
+	["incorrect object version", { [packedPackage.name]: { ...packedPackage, version: "1.4.0" } }],
+]) {
+	test(`rejects ${label} in npm pack metadata before extraction`, (t) => {
+		const { result, commands } = fixture(t, { packOutput });
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /Published package does not match.*1\.5\.0/);
+		assert.equal(commands.some(({ command, args }) => command === "tar" && args[0] === "xzf"), false);
+		assert.equal(commands.some(({ args }) => args[0] === "ci"), false);
+	});
+}
+
+for (const filename of [null, "", "fixture.tar", "../fixture.tgz", "subdir/fixture.tgz", "subdir\\fixture.tgz"]) {
+	test(`rejects an invalid npm pack filename: ${JSON.stringify(filename)}`, (t) => {
+		const { result, commands } = fixture(t, { packOutput: [{ ...packedPackage, filename }] });
+		assert.equal(result.status, 1);
+		assert.match(result.stderr, /Invalid packed package filename/);
+		assert.equal(commands.some(({ command, args }) => command === "tar" && args[0] === "xzf"), false);
+		assert.equal(commands.some(({ args }) => args[0] === "ci"), false);
+	});
+}
