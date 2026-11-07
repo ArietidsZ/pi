@@ -31,6 +31,8 @@ export interface SseEvent {
 
 export interface ConsumeSseOptions {
 	maxEventBytes?: number;
+	/** Cancels the reader when the stream's owner stops, independently of the fetch implementation. */
+	signal?: AbortSignal;
 	onEvent(event: SseEvent): void;
 	/** Called for every `id` field, including events without data (for example resumption priming events). */
 	onId?(id: string): void;
@@ -40,6 +42,10 @@ export interface ConsumeSseOptions {
 
 export async function consumeSseStream(stream: ReadableStream<Uint8Array>, options: ConsumeSseOptions): Promise<void> {
 	const reader = stream.getReader();
+	const onAbort = () => {
+		void reader.cancel().catch(() => {});
+	};
+	options.signal?.addEventListener("abort", onAbort, { once: true });
 	const decoder = new TextDecoder();
 	let buffered = "";
 	let eventName: string | undefined;
@@ -65,6 +71,7 @@ export async function consumeSseStream(stream: ReadableStream<Uint8Array>, optio
 	};
 
 	const processLine = (line: string) => {
+		options.signal?.throwIfAborted();
 		if (line === "") {
 			dispatch();
 			return;
@@ -106,8 +113,10 @@ export async function consumeSseStream(stream: ReadableStream<Uint8Array>, optio
 	};
 
 	try {
+		options.signal?.throwIfAborted();
 		while (true) {
 			const { done, value } = await reader.read();
+			options.signal?.throwIfAborted();
 			if (done) break;
 			let text = decoder.decode(value, { stream: true });
 			// A CRLF split across chunks: the CR already ended the line, so drop the LF.
@@ -132,6 +141,7 @@ export async function consumeSseStream(stream: ReadableStream<Uint8Array>, optio
 		void reader.cancel().catch(() => {});
 		throw error;
 	} finally {
+		options.signal?.removeEventListener("abort", onAbort);
 		reader.releaseLock();
 	}
 }
@@ -216,16 +226,23 @@ async function readBodyText(
 	response: Response,
 	maxBytes: number,
 	mode: "complete" | "prefix" = "complete",
+	signal?: AbortSignal,
 ): Promise<{ text: string; truncated: boolean }> {
 	if (!response.body) return { text: "", truncated: false };
 	const reader = response.body.getReader();
+	const onAbort = () => {
+		void reader.cancel().catch(() => {});
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
 	const decoder = new TextDecoder();
 	let text = "";
 	let remaining = maxBytes;
 	let complete = false;
 	try {
+		signal?.throwIfAborted();
 		while (true) {
 			const { done, value } = await reader.read();
+			signal?.throwIfAborted();
 			if (done) {
 				complete = true;
 				return { text: text + decoder.decode(), truncated: false };
@@ -240,6 +257,7 @@ async function readBodyText(
 			if (remaining === 0 && mode === "prefix") return { text, truncated: true };
 		}
 	} finally {
+		signal?.removeEventListener("abort", onAbort);
 		if (!complete) void reader.cancel().catch(() => {});
 		reader.releaseLock();
 	}
@@ -322,7 +340,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		const type = contentType(response);
 		if (type === "application/json") {
 			const maxBytes = this.options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES;
-			const { text, truncated } = await readBodyText(response, maxBytes);
+			const { text, truncated } = await readBodyText(response, maxBytes, "complete", this.controller.signal);
 			if (truncated) throw new Error(`MCP JSON response exceeds ${maxBytes} bytes`);
 			const body: unknown = JSON.parse(text);
 			for (const item of Array.isArray(body) ? body : [body]) {
@@ -342,7 +360,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	async close(): Promise<void> {
 		if (this.closed) return;
 		this.closed = true;
-		this.controller.abort();
+		this.controller.abort(new McpConnectionClosedError());
 		if (this.started && this.sessionIdValue) {
 			// Best effort: the session expires on the server anyway. The auth provider may refresh tokens
 			// over the network, so it is not asked here and closing never waits for a refresh.
@@ -427,7 +445,12 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		}
 		if (response.ok) return;
 		// Reads only the excerpt the error keeps and cancels the rest, so a huge error body is never buffered.
-		const body = (await readBodyText(response, MAX_ERROR_BODY_BYTES, "prefix").catch(() => ({ text: "" }))).text;
+		const body = (
+			await readBodyText(response, MAX_ERROR_BODY_BYTES, "prefix", this.controller.signal).catch(() => ({
+				text: "",
+			}))
+		).text;
+		if (this.closed) throw new McpConnectionClosedError();
 		if (response.status === 401) throw new McpAuthRequiredError(response, body);
 		if (response.status === 404 && this.sessionIdValue) throw new McpSessionExpiredError(body);
 		throw new McpHttpError(response.status, describeHttpFailure(response.status, body), body);
@@ -444,6 +467,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		}
 		await consumeSseStream(stream, {
 			maxEventBytes: this.options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES,
+			signal: this.controller.signal,
 			onId: (id) => {
 				cursor.lastEventId = id;
 			},
