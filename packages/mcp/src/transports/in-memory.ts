@@ -1,5 +1,5 @@
-import { type JsonRpcMessage, McpConnectionClosedError } from "../protocol/jsonrpc.ts";
-import { type McpTransport, TransportEvents } from "./transport.ts";
+import { type JsonRpcMessage, McpAbortError, McpConnectionClosedError } from "../protocol/jsonrpc.ts";
+import { type McpTransport, type McpTransportSendOptions, TransportEvents } from "./transport.ts";
 
 export class InMemoryTransport extends TransportEvents implements McpTransport {
 	private peer: InMemoryTransport | undefined;
@@ -16,12 +16,16 @@ export class InMemoryTransport extends TransportEvents implements McpTransport {
 		this.started = true;
 	}
 
-	async send(message: JsonRpcMessage): Promise<void> {
+	async send(message: JsonRpcMessage, options: McpTransportSendOptions = {}): Promise<void> {
+		const signal = options.signal;
 		if (!this.started || this.closed) throw new McpConnectionClosedError();
 		const peer = this.peer;
 		if (!peer?.started || peer.closed) throw new McpConnectionClosedError("In-memory MCP peer is not connected");
+		if (signal?.aborted) throw new McpAbortError();
 		const copy = structuredClone(message);
-		queueMicrotask(() => peer.deliver(copy));
+		queueMicrotask(() => {
+			if (!signal?.aborted && !this.closed) peer.deliver(copy);
+		});
 	}
 
 	async close(): Promise<void> {

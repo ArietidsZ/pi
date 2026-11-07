@@ -49,8 +49,6 @@ jobs:
         with:
           ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
-          # The compatibility check reads the latest release's source from its git tag.
-          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

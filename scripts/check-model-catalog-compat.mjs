@@ -32,6 +32,14 @@ import { MINIMUM_PI_VERSION } from "./model-catalog-minimum-version.mjs";
 import { compareModelCatalogPiVersions } from "./model-catalog-protocol.ts";
 
 const PI_AI_PACKAGE = "@earendil-works/pi-ai";
+const PI_REPOSITORY = "https://github.com/earendil-works/pi.git";
+// Repository-local variables from `git rev-parse --local-env-vars`, plus namespaces.
+const GIT_REPOSITORY_ENV = [
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+	"GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+	"GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
+	"GIT_COMMON_DIR", "GIT_NAMESPACE",
+];
 
 /** Read a release's built-in model data (`dist/providers/data`) as model lists by provider. */
 function readBuiltinModels(dataDir) {
@@ -62,7 +70,9 @@ function mergeReleaseCatalog(builtin, catalog) {
 }
 
 function run(command, args, cwd) {
-	const result = spawnSync(command, args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+	const env = { ...process.env };
+	for (const name of GIT_REPOSITORY_ENV) delete env[name];
+	const result = spawnSync(command, args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 	if (result.error) throw result.error;
 	if (result.status !== 0) {
 		const output = [result.stdout, result.stderr].filter(Boolean).join("\n").trim();
@@ -88,16 +98,42 @@ function main() {
 	const releaseDir = join(temporaryDir, "release");
 	try {
 		console.log(`Checking the model catalog against pi ${release}...`);
-		// The release's source code.
+		// A fork or shallow checkout need not have official release tags. Read only the
+		// requested official tag into a temporary repository, never into the checkout.
+		const gitDir = `--git-dir=${join(temporaryDir, "source.git")}`;
+		run("git", [gitDir, "init", "--bare"], temporaryDir);
+		run("git", [gitDir, "fetch", "--depth=1", "--no-tags", PI_REPOSITORY, `refs/tags/v${release}`], temporaryDir);
+		const commit = run("git", [gitDir, "rev-parse", "--verify", "FETCH_HEAD^{commit}"], temporaryDir).trim();
+		console.log(`Official release source: ${PI_REPOSITORY} v${release} (${commit})`);
 		const archive = join(temporaryDir, "release.tar");
-		run("git", ["archive", "--prefix=release/", "--output", archive, `v${release}`], root);
+		run("git", [gitDir, "archive", "--prefix=release/", "--output", archive, commit], temporaryDir);
 		run("tar", ["xf", archive, "-C", temporaryDir], root);
+		const manifest = JSON.parse(readFileSync(join(releaseDir, "packages/ai/package.json"), "utf8"));
+		if (manifest.name !== PI_AI_PACKAGE || manifest.version !== release) {
+			throw new Error(`Official release source does not match ${PI_AI_PACKAGE}@${release}.`);
+		}
 
 		// The built-in models users have: the data shipped in the published package.
-		const [{ filename }] = JSON.parse(
-			run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--pack-destination", temporaryDir, "--json"], root),
+		const packResult = JSON.parse(
+			run("npm", ["pack", `${PI_AI_PACKAGE}@${release}`, "--ignore-scripts", "--pack-destination", temporaryDir, "--json"], root),
 		);
-		run("tar", ["xzf", join(temporaryDir, filename), "-C", temporaryDir, "package/dist/providers/data"], root);
+		// npm 12 keys results by package name; npm 10/11 return an array.
+		let packed;
+		if (Array.isArray(packResult)) {
+			if (packResult.length === 1) packed = packResult[0];
+		} else if (
+			packResult !== null && typeof packResult === "object" &&
+			Object.keys(packResult).length === 1 && Object.hasOwn(packResult, PI_AI_PACKAGE)
+		) {
+			packed = packResult[PI_AI_PACKAGE];
+		}
+		if (packed?.name !== PI_AI_PACKAGE || packed.version !== release) {
+			throw new Error(`Published package does not match ${PI_AI_PACKAGE}@${release}.`);
+		}
+		if (typeof packed.filename !== "string" || !/^[^/\\]+\.tgz$/.test(packed.filename)) {
+			throw new Error("Invalid packed package filename.");
+		}
+		run("tar", ["xzf", join(temporaryDir, packed.filename), "-C", temporaryDir, "package/dist/providers/data"], root);
 		const builtin = readBuiltinModels(join(temporaryDir, "package/dist/providers/data"));
 		const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
 		const mergedPath = join(temporaryDir, "models.all.json");
@@ -106,7 +142,7 @@ function main() {
 		console.log("Installing the release's dependencies...");
 		run("npm", ["ci", "--ignore-scripts", "--no-audit", "--no-fund"], releaseDir);
 		// pi-ai's types depend on the declarations of its workspace dependencies.
-		const { dependencies } = JSON.parse(readFileSync(join(releaseDir, "packages/ai/package.json"), "utf8"));
+		const { dependencies } = manifest;
 		for (const name of Object.keys(dependencies).filter((name) => name.startsWith("@earendil-works/"))) {
 			run("npm", ["run", "build", "--workspace", name], releaseDir);
 		}
